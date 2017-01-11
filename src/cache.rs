@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
-use futures::{self, future, Async, Future, IntoFuture, Poll};
+use futures::{self, future, Async, Fuse, Future, IntoFuture, Poll};
 use futures::sync::oneshot::{self, Sender, Receiver};
 
 use linked_hash_map::LinkedHashMap;
@@ -14,16 +14,14 @@ use mio::timer::{Builder as TimerBuilder, Timer};
 
 use tokio_core::reactor::{Handle, PollEvented};
 
-const IGNORE_CACHED: bool = false;
-const LOOKUP_CACHED: bool = true;
-
-type Loader<V, E> = mpsc::Receiver<Result<Arc<V>, E>>;
+type Checker<V> = Sender<Option<Arc<V>>>;
+type Loader<V, E> = Receiver<Result<Arc<V>, E>>;
 type Waiter<V, E> = Sender<Result<Option<Arc<V>>, E>>;
 
 enum Message<K, V, E> {
     Stats(Sender<CacheStats>),
     Get(K, Waiter<V, E>),
-    Load(K, Loader<V, E>, Waiter<V, E>, bool),
+    Load(K, Option<Checker<V>>, Loader<V, E>, Waiter<V, E>),
     Evict(K, Sender<()>),
 }
 
@@ -46,11 +44,15 @@ pub struct GetHandle<V, E> {
     rx: Receiver<Result<Option<Arc<V>>, E>>,
 }
 
+enum LoadState<F: Future, V, E> {
+    Empty, // used for state transitions
+    Checking(Receiver<Option<Arc<V>>>, Fuse<F>, Sender<Result<Arc<V>, E>>, GetHandle<V, E>),
+    Loading(Fuse<F>, Sender<Result<Arc<V>, E>>, GetHandle<V, E>),
+    Waiting(GetHandle<V, E>),
+}
+
 pub struct LoadHandle<F: Future, V, E> {
-    inner: future::Fuse<F>,
-    tx: mpsc::Sender<Result<Arc<V>, E>>,
-    get: GetHandle<V, E>,
-    loaded: bool,
+    state: LoadState<F, V, E>,
 }
 
 struct CacheEntry<V> {
@@ -86,40 +88,55 @@ impl<F, V, E: Clone> Future for LoadHandle<F, V, E>
     type Error = E;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         println!("loadhandle - start");
-        match self.get.poll() {
-            Ok(Async::Ready(Some(res))) => {
-                println!("loadhandle - end+ok");
-                return Ok(res.into());
-            }
-            Ok(Async::Ready(None)) => unreachable!(),
-            Ok(Async::NotReady) => (), // noop
-            Err(e) => {
-                println!("loadhandle - end+err");
-                return Err(e);
-            }
-        };
 
-        if self.loaded {
+        let mut state = ::std::mem::replace(&mut self.state, LoadState::Empty);
+
+        if let LoadState::Checking(mut checker, loader, resolver, waiter) = state {
+            match checker.poll().expect("check canceled") {
+                Async::Ready(Some(res)) => return Ok(res.into()),
+                Async::Ready(None) => {
+                    state = LoadState::Loading(loader, resolver, waiter);
+                }
+                Async::NotReady => {
+                    self.state = LoadState::Checking(checker, loader, resolver, waiter);
+                    return Ok(Async::NotReady);
+                }
+            }
+        }
+
+        if let LoadState::Loading(mut loader, resolver, waiter) = state {
+            match loader.poll() {
+                Ok(Async::Ready(res)) => {
+                    println!("loadhandle - success");
+                    resolver.complete(Ok(Arc::new(res)));
+                    state = LoadState::Waiting(waiter);
+                }
+                Err(e) => {
+                    println!("loadhandle - failure");
+                    resolver.complete(Err(e));
+                    state = LoadState::Waiting(waiter);
+                }
+                Ok(Async::NotReady) => {
+                    self.state = LoadState::Loading(loader, resolver, waiter);
+                    return Ok(Async::NotReady);
+                }
+            }
+        }
+
+        if let LoadState::Waiting(mut waiter) = state {
             println!("loadhandle - waiting");
-            return Ok(Async::NotReady);
+            return match waiter.poll() {
+                Ok(Async::Ready(Some(res))) => Ok(res.into()),
+                Ok(Async::Ready(None)) => unreachable!(),
+                Ok(Async::NotReady) => {
+                    self.state = LoadState::Waiting(waiter);
+                    Ok(Async::NotReady)
+                }
+                Err(e) => Err(e),
+            };
         }
 
-        match self.inner.poll() {
-            Ok(Async::Ready(res)) => {
-                println!("loadhandle - success");
-                self.loaded = true;
-                let arc = Arc::new(res);
-                self.tx.send(Ok(arc.clone())).unwrap();
-                Ok(Async::NotReady)
-            }
-            Err(e) => {
-                println!("loadhandle - failure");
-                self.loaded = true;
-                self.tx.send(Err(e.clone())).unwrap();
-                Ok(Async::NotReady)
-            }
-            _ => Ok(Async::NotReady),
-        }
+        unreachable!("invalid state transition")
     }
 }
 
@@ -157,18 +174,35 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone + Debug> ReactorCache<K, V, E> 
         self.load(k, futures::lazy(f))
     }
 
+    pub fn load_if_absent_fn<F, T>(&self, k: K, f: F) -> LoadHandle<futures::Lazy<F, T>, V, E>
+        where F: 'static + Send + FnOnce() -> T,
+              T: 'static + IntoFuture<Item = V, Error = E>,
+              T::Future: 'static + Send
+    {
+        self.load_if_absent(k, futures::lazy(f))
+    }
+
     pub fn load<F>(&self, k: K, f: F) -> LoadHandle<F, V, E>
         where F: Future<Item = V, Error = E>
     {
-        let (load_tx, load_rx) = mpsc::channel();
+        let (load_tx, load_rx) = oneshot::channel();
         let (get_tx, get_rx) = oneshot::channel();
-        self.tx.send(Message::Load(k, load_rx, get_tx, IGNORE_CACHED)).unwrap();
-        LoadHandle {
-            inner: f.fuse(),
-            tx: load_tx,
-            get: GetHandle { rx: get_rx },
-            loaded: false,
-        }
+        self.tx.send(Message::Load(k, None, load_rx, get_tx)).unwrap();
+
+        let state = LoadState::Loading(f.fuse(), load_tx, GetHandle { rx: get_rx });
+        LoadHandle { state: state }
+    }
+
+    pub fn load_if_absent<F>(&self, k: K, f: F) -> LoadHandle<F, V, E>
+        where F: Future<Item = V, Error = E>
+    {
+        let (check_tx, check_rx) = oneshot::channel();
+        let (load_tx, load_rx) = oneshot::channel();
+        let (get_tx, get_rx) = oneshot::channel();
+        self.tx.send(Message::Load(k, Some(check_tx), load_rx, get_tx)).unwrap();
+
+        let state = LoadState::Checking(check_rx, f.fuse(), load_tx, GetHandle { rx: get_rx });
+        LoadHandle { state: state }
     }
 
     pub fn evict(&self, k: K) -> Receiver<()> {
@@ -210,11 +244,11 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
         }
 
         let mut to_upgrade = vec![];
-        for (k, &(ref f, _)) in self.fetch_map.iter() {
-            match f.try_recv() {
-                Ok(r) => to_upgrade.push((k.clone(), Some(r))),
-                Err(TryRecvError::Empty) => continue,
-                Err(TryRecvError::Disconnected) => to_upgrade.push((k.clone(), None)),
+        for (k, &mut (ref mut f, _)) in self.fetch_map.iter_mut() {
+            match f.poll() {
+                Ok(Async::Ready(r)) => to_upgrade.push((k.clone(), Some(r))),
+                Ok(Async::NotReady) => continue,
+                Err(_) => to_upgrade.push((k.clone(), None)),
             };
         }
 
@@ -222,6 +256,7 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
             let (_, waiters) = self.fetch_map.remove(&k).unwrap();
             if let Some(r) = r_opt {
                 for waiter in waiters.into_iter() {
+                    println!("upgrade -- waiter");
                     waiter.complete(r.clone().map(Some));
                 }
 
@@ -268,7 +303,7 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
         match msg {
             Message::Stats(tx) => self.stats(tx),
             Message::Get(k, tx) => self.get(k, tx),
-            Message::Load(k, rx, tx, lookup) => self.load(k, rx, tx, lookup),
+            Message::Load(k, ck, rx, tx) => self.load(k, ck, rx, tx),
             Message::Evict(k, tx) => self.evict(k, tx),
         };
         println!("handle -- end");
@@ -303,15 +338,16 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
         tx.complete(Ok(None));
     }
 
-    fn load(&mut self, k: K, f: Loader<V, E>, tx: Waiter<V, E>, lookup: bool) {
+    fn load(&mut self, k: K, checker: Option<Checker<V>>, f: Loader<V, E>, tx: Waiter<V, E>) {
         println!("load -- start");
-        // if lookup == LOOKUP_CACHED {
-        // if let Some(mut entry) = self.cache_map.get_refresh(&k) {
-        // entry.marked = false;
-        // return tx.complete(Ok(Some(entry.inner.clone())));
-        // }
-        // }
-        //
+        if let Some(checker) = checker {
+            if let Some(mut entry) = self.cache_map.get_refresh(&k) {
+                entry.marked = false;
+                return checker.complete(Some(entry.inner.clone()));
+            }
+            checker.complete(None);
+        }
+
         self.fetch_map.insert(k, (f, vec![tx]));
         println!("load -- end");
     }
@@ -415,14 +451,16 @@ mod tests {
         assert_eq!(8, stats.remaining);
     }
 
-    // #[test]
-    // fn load_if_absent() {
-    // let core = Core::new().unwrap();
-    // let mut cache: ReactorCache<_, _, ()> = ReactorCache::new(16, core.handle());
-    //
-    // assert_eq!(10, *cache.load_if_absent_fn(1, || Ok(10)).wait().unwrap());
-    // assert_eq!(10, *cache.load_if_absent_fn(1, || Ok(11)).wait().unwrap());
-    // }
+    #[test]
+    fn load_if_absent() {
+        let mut core = Core::new().unwrap();
+        let cache: ReactorCache<_, _, ()> = ReactorCache::new(16, core.handle());
+
+        assert_eq!(10,
+                   *core.run(cache.load_if_absent_fn(1, || Ok(10))).unwrap());
+        assert_eq!(10,
+                   *core.run(cache.load_if_absent_fn(1, || Ok(11))).unwrap());
+    }
 
     #[test]
     fn errors() {
