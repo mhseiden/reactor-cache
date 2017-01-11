@@ -1,6 +1,7 @@
-extern crate crossbeam;
+#[macro_use]
+extern crate log;
+
 extern crate futures;
-extern crate futures_cpupool;
 extern crate linked_hash_map;
 extern crate mio;
 extern crate tokio_core;

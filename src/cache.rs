@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
-use futures::{self, future, Async, Fuse, Future, IntoFuture, Poll};
+use futures::{self, Async, Fuse, Future, IntoFuture, Poll};
 use futures::sync::oneshot::{self, Sender, Receiver};
 
 use linked_hash_map::LinkedHashMap;
@@ -87,7 +87,7 @@ impl<F, V, E: Clone> Future for LoadHandle<F, V, E>
     type Item = Arc<V>;
     type Error = E;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        println!("loadhandle - start");
+        trace!("loadhandle - start");
 
         let mut state = ::std::mem::replace(&mut self.state, LoadState::Empty);
 
@@ -107,12 +107,12 @@ impl<F, V, E: Clone> Future for LoadHandle<F, V, E>
         if let LoadState::Loading(mut loader, resolver, waiter) = state {
             match loader.poll() {
                 Ok(Async::Ready(res)) => {
-                    println!("loadhandle - success");
+                    trace!("loadhandle - success");
                     resolver.complete(Ok(Arc::new(res)));
                     state = LoadState::Waiting(waiter);
                 }
                 Err(e) => {
-                    println!("loadhandle - failure");
+                    trace!("loadhandle - failure");
                     resolver.complete(Err(e));
                     state = LoadState::Waiting(waiter);
                 }
@@ -124,7 +124,7 @@ impl<F, V, E: Clone> Future for LoadHandle<F, V, E>
         }
 
         if let LoadState::Waiting(mut waiter) = state {
-            println!("loadhandle - waiting");
+            trace!("loadhandle - waiting");
             return match waiter.poll() {
                 Ok(Async::Ready(Some(res))) => Ok(res.into()),
                 Ok(Async::Ready(None)) => unreachable!(),
@@ -237,9 +237,9 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
     }
 
     fn upgrade_fetches(&mut self) -> Result<(), ()> {
-        println!("upgrade -- start");
+        trace!("upgrade -- start");
         if self.fetch_map.is_empty() {
-            println!("upgrade -- empty");
+            trace!("upgrade -- empty");
             return Ok(());
         }
 
@@ -256,7 +256,7 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
             let (_, waiters) = self.fetch_map.remove(&k).unwrap();
             if let Some(r) = r_opt {
                 for waiter in waiters.into_iter() {
-                    println!("upgrade -- waiter");
+                    trace!("upgrade -- waiter");
                     waiter.complete(r.clone().map(Some));
                 }
 
@@ -266,17 +266,17 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
             }
         }
 
-        println!("upgrade -- end");
+        trace!("upgrade -- end");
         Ok(())
     }
 
     fn try_cache(&mut self, k: K, v: Arc<V>) {
-        println!("trycache -- start");
+        trace!("trycache -- start");
         let (ref mut remaining, capacity) = self.usage;
 
         let entry = CacheEntry::new(v);
         if entry.weight >= capacity {
-            println!("trycache -- toobig");
+            trace!("trycache -- toobig");
             return;
         }
 
@@ -295,51 +295,51 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
                 self.cache_map.insert(k2, v2);
             }
         }
-        println!("trycache -- end");
+        trace!("trycache -- end");
     }
 
     fn handle(&mut self, msg: Message<K, V, E>) -> Result<(), ()> {
-        println!("handle -- start");
+        trace!("handle -- start");
         match msg {
             Message::Stats(tx) => self.stats(tx),
             Message::Get(k, tx) => self.get(k, tx),
             Message::Load(k, ck, rx, tx) => self.load(k, ck, rx, tx),
             Message::Evict(k, tx) => self.evict(k, tx),
         };
-        println!("handle -- end");
+        trace!("handle -- end");
         Ok(())
     }
 
     fn stats(&mut self, tx: Sender<CacheStats>) {
-        println!("stats -- start");
+        trace!("stats -- start");
         let (remaining, capacity) = self.usage;
         tx.complete(CacheStats {
             entries: self.cache_map.len(),
             remaining: remaining,
             capacity: capacity,
         });
-        println!("stats -- end");
+        trace!("stats -- end");
     }
 
     fn get(&mut self, k: K, tx: Waiter<V, E>) {
-        println!("get -- start");
+        trace!("get -- start");
         if let Some(mut entry) = self.cache_map.get_refresh(&k) {
             entry.marked = false;
-            println!("get -- hit");
+            trace!("get -- hit");
             return tx.complete(Ok(Some(entry.inner.clone())));
         }
 
         if let Some(&mut (_, ref mut waiters)) = self.fetch_map.get_mut(&k) {
-            println!("get -- wait");
+            trace!("get -- wait");
             return waiters.push(tx);
         }
 
-        println!("get -- miss");
+        trace!("get -- miss");
         tx.complete(Ok(None));
     }
 
     fn load(&mut self, k: K, checker: Option<Checker<V>>, f: Loader<V, E>, tx: Waiter<V, E>) {
-        println!("load -- start");
+        trace!("load -- start");
         if let Some(checker) = checker {
             if let Some(mut entry) = self.cache_map.get_refresh(&k) {
                 entry.marked = false;
@@ -349,17 +349,17 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
         }
 
         self.fetch_map.insert(k, (f, vec![tx]));
-        println!("load -- end");
+        trace!("load -- end");
     }
 
     fn evict(&mut self, k: K, tx: Sender<()>) {
-        println!("evict -- start");
+        trace!("evict -- start");
         self.fetch_map.remove(&k);
         if let Some(entry) = self.cache_map.remove(&k) {
             self.usage.0 += entry.weight;
         }
         tx.complete(());
-        println!("evict -- end");
+        trace!("evict -- end");
     }
 }
 
@@ -368,9 +368,9 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Future for Inner<K, V, E> {
     type Error = (); // TODO - E doesn't work out of the box...
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        println!("poll -- start");
+        trace!("poll -- start");
         if let Async::NotReady = self.timer.poll_read() {
-            println!("poll -- not ready");
+            trace!("poll -- not ready");
             return Ok(Async::NotReady);
         }
 
@@ -383,12 +383,12 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Future for Inner<K, V, E> {
             match self.rx.try_recv() {
                 Ok(msg) => self.handle(msg)?,
                 Err(TryRecvError::Empty) => {
-                    println!("poll -- end");
+                    trace!("poll -- end");
                     self.timer.get_mut().set_timeout(Duration::from_millis(10), ()).unwrap();
                     return Ok(Async::NotReady);
                 }
                 Err(TryRecvError::Disconnected) => {
-                    println!("poll -- terminate");
+                    trace!("poll -- terminate");
                     return Ok(().into());
                 }
             }
@@ -399,11 +399,7 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Future for Inner<K, V, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::thread;
-
-    use futures;
-    use tokio_core::reactor::{Core, Remote};
+    use tokio_core::reactor::Core;
 
     impl Weighted for i64 {
         fn weight(&self) -> usize {

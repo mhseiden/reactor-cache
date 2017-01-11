@@ -1,12 +1,11 @@
 [package]
-name = "fu-cache"
+name = "reactor-cache"
 version = "0.1.0"
 authors = ["Max Seiden <max@sigmacomputing.io>"]
 
 [dependencies]
-crossbeam = "0.2"
 futures = "0.1.6"
-futures-cpupool = "0.1.2"
 linked-hash-map = "0.3.0"
+log = "0.3"
 mio = "0.6"
 tokio-core = "0.1"
