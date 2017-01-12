@@ -33,6 +33,7 @@ pub struct ReactorCache<K, V, E> {
     tx: mpsc::Sender<Message<K, V, E>>,
 }
 
+#[derive(Debug)]
 pub struct CacheStats {
     pub entries: usize,
     pub remaining: usize,
