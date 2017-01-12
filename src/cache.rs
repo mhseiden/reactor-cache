@@ -20,7 +20,7 @@ type Waiter<V, E> = Sender<Result<Option<Arc<V>>, E>>;
 
 enum Message<K, V, E> {
     Stats(Sender<CacheStats>),
-    Get(K, Waiter<V, E>),
+    Get(K, bool, Waiter<V, E>),
     Load(K, Checker<V>, Loader<V, E>, Waiter<V, E>),
     Evict(K, Sender<()>),
 }
@@ -174,7 +174,13 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone + Debug> ReactorCache<K, V, E> 
 
     pub fn get(&self, k: K) -> GetHandle<V, E> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Message::Get(k, tx)).unwrap();
+        self.tx.send(Message::Get(k, true, tx)).unwrap();
+        GetHandle { rx: rx }
+    }
+
+    pub fn get_if_resident(&self, k: K) -> GetHandle<V, E> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Message::Get(k, false, tx)).unwrap();
         GetHandle { rx: rx }
     }
 
@@ -296,7 +302,7 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
         trace!("handle -- start");
         match msg {
             Message::Stats(tx) => self.stats(tx),
-            Message::Get(k, tx) => self.get(k, tx),
+            Message::Get(k, w, tx) => self.get(k, w, tx),
             Message::Load(k, ck, rx, tx) => self.load(k, ck, rx, tx),
             Message::Evict(k, tx) => self.evict(k, tx),
         };
@@ -315,7 +321,7 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
         trace!("stats -- end");
     }
 
-    fn get(&mut self, k: K, tx: Waiter<V, E>) {
+    fn get(&mut self, k: K, wait: bool, tx: Waiter<V, E>) {
         trace!("get -- start");
         if let Some(mut entry) = self.cache_map.get_refresh(&k) {
             entry.marked = false;
@@ -323,9 +329,11 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
             return tx.complete(Ok(Some(entry.inner.clone())));
         }
 
-        if let Some(&mut (_, ref mut waiters)) = self.fetch_map.get_mut(&k) {
-            trace!("get -- wait");
-            return waiters.push(tx);
+        if wait {
+            if let Some(&mut (_, ref mut waiters)) = self.fetch_map.get_mut(&k) {
+                trace!("get -- wait");
+                return waiters.push(tx);
+            }
         }
 
         trace!("get -- miss");
@@ -456,6 +464,25 @@ mod tests {
         assert_eq!(10, *core.run(l1).unwrap());
         assert_eq!(10, *core.run(g1).unwrap().unwrap());
         assert_eq!(10, *core.run(l2).unwrap());
+    }
+
+    #[test]
+    fn get_if_resident() {
+        let mut core = Core::new().unwrap();
+        let cache = ReactorCache::<i64, i64, i64>::new(16, core.handle());
+
+        let l1 = cache.load_fn(1, || Ok(10));
+        let g1 = cache.get_if_resident(1);
+        let g2 = cache.get_if_resident(1);
+
+        // because of how events are processed, both gets are misses
+        assert_eq!(None, core.run(g1).unwrap());
+        assert_eq!(10, *core.run(l1).unwrap());
+        assert_eq!(None, core.run(g2).unwrap());
+
+        // since the load has resolved, this will be a cache hit
+        let g3 = cache.get_if_resident(1);
+        assert_eq!(10, *core.run(g3).unwrap().unwrap());
     }
 
     #[test]
