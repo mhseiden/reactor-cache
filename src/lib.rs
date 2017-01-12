@@ -7,5 +7,4 @@ extern crate mio;
 extern crate tokio_core;
 
 mod cache;
-
-pub use cache::ReactorCache;
+pub use cache::*;
