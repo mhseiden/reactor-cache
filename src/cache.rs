@@ -379,7 +379,8 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Future for Inner<K, V, E> {
             return Ok(Async::NotReady);
         }
 
-        // schedule Inner for the next loop
+        // remove scheduled bits and schedule Inner for the next loop
+        while let Some(_) = self.timer.get_mut().poll() {}
         self.timer.need_read();
 
         self.upgrade_fetches()?;
