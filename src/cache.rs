@@ -14,7 +14,11 @@ use mio::timer::{Builder as TimerBuilder, Timer};
 
 use tokio_core::reactor::{Handle, PollEvented};
 
-type Checker<V> = Sender<Option<Arc<V>>>;
+// for the Checker error case
+const LEADER: bool = true;
+const WAITER: bool = !LEADER;
+
+type Checker<V> = Sender<Result<Arc<V>, bool>>;
 type Loader<V, E> = Receiver<Result<Arc<V>, E>>;
 type Waiter<V, E> = Sender<Result<Option<Arc<V>>, E>>;
 
@@ -46,7 +50,7 @@ pub struct GetHandle<V, E> {
 
 enum LoadState<F: Future, V, E> {
     Empty, // used for state transitions
-    Checking(Receiver<Option<Arc<V>>>, Fuse<F>, Sender<Result<Arc<V>, E>>, GetHandle<V, E>),
+    Checking(Receiver<Result<Arc<V>, bool>>, Fuse<F>, Sender<Result<Arc<V>, E>>, GetHandle<V, E>),
     Loading(Fuse<F>, Sender<Result<Arc<V>, E>>, GetHandle<V, E>),
     Waiting(GetHandle<V, E>),
 }
@@ -94,13 +98,17 @@ impl<F, V, E: Clone> Future for LoadHandle<F, V, E>
         if let LoadState::Checking(mut checker, loader, resolver, waiter) = state {
             trace!("loadhandle - checking");
             match checker.poll().expect("check canceled") {
-                Async::Ready(Some(res)) => {
+                Async::Ready(Ok(res)) => {
                     trace!("loadhandle - hit");
                     return Ok(res.into());
                 }
-                Async::Ready(None) => {
-                    trace!("loadhandle - miss");
+                Async::Ready(Err(LEADER)) => {
+                    trace!("loadhandle - miss:leader");
                     state = LoadState::Loading(loader, resolver, waiter);
+                }
+                Async::Ready(Err(WAITER)) => {
+                    trace!("loadhandle - miss:waiter");
+                    state = LoadState::Waiting(waiter);
                 }
                 Async::NotReady => {
                     self.state = LoadState::Checking(checker, loader, resolver, waiter);
@@ -152,7 +160,9 @@ impl<F, V, E: Clone> Future for LoadHandle<F, V, E>
     }
 }
 
+/// Core methods for interacting with the cache
 impl<K: Clone + Eq + Hash, V: Weighted, E: Clone + Debug> ReactorCache<K, V, E> {
+    /// Creates a new Reactor Cache with the given capacity, which runs in `handle`'s event-loop
     pub fn new(capacity: usize, handle: Handle) -> Self
         where K: 'static,
               V: 'static,
@@ -166,12 +176,61 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone + Debug> ReactorCache<K, V, E> 
         ReactorCache { tx: tx }
     }
 
+    /// Returns a future with a snapshot of the cache's stats. No guarnatees are made about
+    /// when the snapshot is taken.
+    ///
+    /// # Example
+    ///
+    /// Run a future that logs the cache stats:
+    ///
+    /// ```
+    /// # extern crate futures;
+    /// # extern crate reactor_cache;
+    /// # extern crate tokio_core;
+    /// #
+    /// # use futures::Future;
+    /// # use reactor_cache::*;
+    /// # use tokio_core::reactor::Core;
+    /// #
+    /// # #[derive(Clone, Eq, Hash, PartialEq)] struct Int(i64);
+    /// # impl Weighted for Int { fn weight(&self) -> usize { 8 } }
+    /// #
+    /// # fn main() {
+    ///     let mut core = Core::new().expect("meltdown");
+    ///     let cache = ReactorCache::<Int, Int, ()>::new(10, core.handle());
+    ///     core.run(cache.stats().map(|s| println!("{:?}",s))).unwrap();
+    /// # }
     pub fn stats(&self) -> Receiver<CacheStats> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(Message::Stats(tx)).unwrap();
         rx
     }
 
+    /// Returns a future with a snapshot of the cache's stats. No guarnatees are made about
+    /// when the snapshot is taken.
+    ///
+    /// # Example
+    ///
+    /// Run a future that logs the cache stats:
+    ///
+    /// ```
+    /// # extern crate futures;
+    /// # extern crate reactor_cache;
+    /// # extern crate tokio_core;
+    /// #
+    /// # use futures::Future;
+    /// # use reactor_cache::*;
+    /// # use tokio_core::reactor::Core;
+    /// #
+    /// # #[derive(Clone, Eq, Hash, PartialEq)] struct Int(i64);
+    /// # impl Weighted for Int { fn weight(&self) -> usize { 8 } }
+    /// #
+    /// # fn main() {
+    ///     let mut core = Core::new().expect("meltdown");
+    ///     let cache = ReactorCache::<Int, Int, ()>::new(10, core.handle());
+    ///     core.run(cache.load_fn(Int(1), ||
+    ///     core.run(cache.stats().map(|s| println!("{:?}",s))).unwrap();
+    /// # }
     pub fn get(&self, k: K) -> GetHandle<V, E> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(Message::Get(k, true, tx)).unwrap();
@@ -346,12 +405,12 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Inner<K, V, E> {
         if let Some(mut entry) = self.cache_map.get_refresh(&k) {
             trace!("load -- hit");
             entry.marked = false;
-            return checker.complete(Some(entry.inner.clone()));
+            return checker.complete(Ok(entry.inner.clone()));
         }
         trace!("load -- miss");
-        checker.complete(None);
 
         let &mut (_, ref mut waiters) = self.fetch_map.entry(k).or_insert((f, vec![]));
+        checker.complete(Err(waiters.is_empty())); // if there are no waiters, we're the leader
         waiters.push(tx);
 
         trace!("load -- end");
@@ -405,6 +464,10 @@ impl<K: Clone + Eq + Hash, V: Weighted, E: Clone> Future for Inner<K, V, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use tokio_core::reactor::Core;
 
     impl Weighted for i64 {
@@ -458,13 +521,18 @@ mod tests {
         let mut core = Core::new().unwrap();
         let cache = ReactorCache::<i64, i64, i64>::new(16, core.handle());
 
-        let l1 = cache.load_fn(1, || Ok(10));
+        let counter = Arc::new(AtomicUsize::new(10));
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+
+        let l1 = cache.load_fn(1, move || Ok(c1.fetch_add(1, Ordering::SeqCst) as i64));
         let g1 = cache.get(1);
-        let l2 = cache.load_fn(1, || Ok(11));
+        let l2 = cache.load_fn(1, move || Ok(c2.fetch_add(1, Ordering::SeqCst) as i64));
 
         assert_eq!(10, *core.run(l1).unwrap());
         assert_eq!(10, *core.run(g1).unwrap().unwrap());
         assert_eq!(10, *core.run(l2).unwrap());
+        assert_eq!(11, counter.load(Ordering::SeqCst));
     }
 
     #[test]
