@@ -3,6 +3,8 @@ name = "reactor-cache"
 version = "0.1.1"
 authors = ["Max Seiden <140dbs@gmail.com>"]
 description = "An async cache using tokio and futures"
+documentation = "https://docs.rs/reactor-cache"
+repository = "https://github.com/mhseiden/reactor-cache"
 license = "MIT"
 
 [dependencies]
